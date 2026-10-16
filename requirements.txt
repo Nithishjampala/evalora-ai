@@ -1,0 +1,10 @@
+google-genai
+pandas
+openpyxl
+pypdf
+python-pptx
+python-docx
+gradio
+gspread
+google-auth
+python-dotenv
