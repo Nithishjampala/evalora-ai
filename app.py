@@ -1,18 +1,16 @@
-
 import os
 import re
 import json
 import time
 import shutil
-import tempfile
 import subprocess
+import tempfile
+from pathlib import Path
 
 import gradio as gr
-import pandas as pd
 import fitz
 import docx
 import gspread
-
 from pptx import Presentation
 from striprtf.striprtf import rtf_to_text
 from dotenv import load_dotenv
@@ -22,40 +20,35 @@ from google.oauth2.service_account import Credentials
 
 
 # =====================================================
-# CONFIGURATION
+# 1. CONFIGURATION
 # =====================================================
 
-load_dotenv()
+BASE_DIR = Path(__file__).resolve().parent
+
+load_dotenv(BASE_DIR / ".env")
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-SERVICE_ACCOUNT_FILE = "service_account.json"
+SERVICE_ACCOUNT_FILE = BASE_DIR / "service_account.json"
 
 SPREADSHEET_ID = "1L8FuY_CFURGrRkWbEFAG_QsHTyF0oUJYfpCfNAl-sOw"
 WORKSHEET_NAME = "Evaluations"
 
-# Keep this list unchanged.
+# Keep the configured model names unchanged.
 MODELS = [
     "gemini-3.8-flash",
     "gemini-3.6-flash",
     "gemini-3.5-flash-lite",
 ]
 
-RATINGS = [
-    "Outstanding",
-    "Very Good",
-    "Good",
-    "Needs improvement",
-    "Incomplete",
-]
-
 RATING_SCORES = {
     "Outstanding": 100,
     "Very Good": 85,
     "Good": 70,
-    "Needs improvement": 40,
+    "Needs Improvement": 40,
     "Incomplete": 0,
 }
 
+# Google Sheets remains at exactly 9 columns.
 SHEET_HEADERS = [
     "Name",
     "Project ID",
@@ -69,13 +62,18 @@ SHEET_HEADERS = [
 ]
 
 SUPPORTED_FILES = [
-    ".txt", ".pdf", ".doc", ".docx",
-    ".ppt", ".pptx", ".rtf",
+    ".txt",
+    ".pdf",
+    ".doc",
+    ".docx",
+    ".ppt",
+    ".pptx",
+    ".rtf",
 ]
 
 
 # =====================================================
-# EVALUATION QUESTIONS
+# 2. PHASE QUESTIONS
 # =====================================================
 
 PHASES = {
@@ -87,6 +85,7 @@ PHASES = {
         "How would you rate the overall quality of the Ideation submission?",
         "Additional feedback to candidate",
     ],
+
     "Design": [
         "How effectively does the design demonstrate the proposed solution?",
         "How well does the design address the identified problem?",
@@ -95,18 +94,20 @@ PHASES = {
         "How would you rate the overall quality of the Design submission?",
         "Additional feedback to candidate",
     ],
+
     "Build": [
-        "How effectively has the team validated the problem with target users?",
-        "Is there evidence that the solution meets user needs?",
-        "How effectively has the team collected and analyzed user feedback?",
-        "How well has the team demonstrated feasibility based on Build?",
+        "How effectively has the team implemented the proposed solution?",
+        "How well does the implementation address the identified problem?",
+        "How effectively has the team demonstrated the core features?",
+        "How feasible is the implementation from a technical perspective?",
         "How would you rate the overall quality of the Build submission?",
         "Additional feedback to candidate",
     ],
+
     "Demo": [
         "How effectively does the final solution address the stated problem?",
         "How well does the solution demonstrate its key features?",
-        "How effectively has the team demonstrated testing and Build?",
+        "How effectively has the team demonstrated testing and validation?",
         "How feasible and sustainable is the proposed solution?",
         "How would you rate the overall quality of the final submission?",
         "Additional feedback to candidate",
@@ -115,133 +116,181 @@ PHASES = {
 
 
 # =====================================================
-# DOCUMENT EXTRACTION
-# TXT, PDF, DOC, DOCX, PPT, PPTX, RTF
+# 3. DOCUMENT EXTRACTION
 # =====================================================
 
-def extract_document(path):
-    if not path:
+def extract_document(file_path):
+    if not file_path:
         raise ValueError("Please upload a document.")
 
-    extension = os.path.splitext(path)[1].lower()
+    file_path = str(file_path)
+    extension = Path(file_path).suffix.lower()
     text = ""
 
     if extension == ".txt":
         for encoding in ("utf-8-sig", "utf-8", "cp1252"):
             try:
-                with open(path, "r", encoding=encoding) as file:
-                    text = file.read()
+                text = Path(file_path).read_text(
+                    encoding=encoding
+                )
                 break
             except UnicodeDecodeError:
                 continue
 
     elif extension == ".pdf":
-        with fitz.open(path) as pdf:
-            text = "\n".join(page.get_text() for page in pdf)
+        with fitz.open(file_path) as pdf:
+            text = "\n".join(
+                page.get_text() for page in pdf
+            )
 
     elif extension == ".docx":
-        document = docx.Document(path)
-        parts = [p.text for p in document.paragraphs]
+        document = docx.Document(file_path)
+
+        parts = [
+            paragraph.text
+            for paragraph in document.paragraphs
+        ]
 
         for table in document.tables:
             for row in table.rows:
                 parts.append(
-                    " | ".join(cell.text for cell in row.cells)
+                    " | ".join(
+                        cell.text for cell in row.cells
+                    )
                 )
 
         text = "\n".join(parts)
 
     elif extension == ".pptx":
-        presentation = Presentation(path)
-        slides = []
+        presentation = Presentation(file_path)
+        slide_text = []
 
-        for number, slide in enumerate(presentation.slides, start=1):
+        for number, slide in enumerate(
+            presentation.slides,
+            start=1,
+        ):
             parts = [f"Slide {number}"]
 
             for shape in slide.shapes:
                 if getattr(shape, "has_text_frame", False):
-                    content = shape.text.strip()
-                    if content:
-                        parts.append(content)
+                    value = shape.text.strip()
+
+                    if value:
+                        parts.append(value)
 
                 if getattr(shape, "has_table", False):
                     for row in shape.table.rows:
                         parts.append(
-                            " | ".join(cell.text for cell in row.cells)
+                            " | ".join(
+                                cell.text
+                                for cell in row.cells
+                            )
                         )
 
-            slides.append("\n".join(parts))
+            # Include speaker notes when available.
+            try:
+                if slide.has_notes_slide:
+                    notes = (
+                        slide.notes_slide
+                        .notes_text_frame.text
+                    )
 
-        text = "\n\n".join(slides)
+                    if notes.strip():
+                        parts.append(
+                            "Speaker notes: " + notes
+                        )
+            except Exception:
+                pass
+
+            slide_text.append("\n".join(parts))
+
+        text = "\n\n".join(slide_text)
 
     elif extension == ".rtf":
-        with open(path, "r", encoding="utf-8", errors="replace") as file:
-            text = rtf_to_text(file.read())
+        raw_text = Path(file_path).read_text(
+            encoding="utf-8",
+            errors="replace",
+        )
+
+        text = rtf_to_text(raw_text)
 
     elif extension in (".doc", ".ppt"):
-        # Legacy Office files are converted using LibreOffice.
         if not shutil.which("libreoffice"):
-            raise RuntimeError(
-                f"{extension} files require LibreOffice. Install it and "
-                "ensure the 'libreoffice' command is available, or save "
-                "the file as DOCX/PPTX."
+            raise ValueError(
+                f"{extension} files require LibreOffice. "
+                "Install LibreOffice or convert the file "
+                "to DOCX/PPTX format."
             )
 
-        output_dir = tempfile.mkdtemp(prefix="evalora_")
-        target_extension = ".docx" if extension == ".doc" else ".pptx"
-        target_format = "docx" if extension == ".doc" else "pptx"
+        target_extension = (
+            ".docx" if extension == ".doc" else ".pptx"
+        )
 
-        try:
-            result = subprocess.run(
+        target_format = (
+            "docx" if extension == ".doc" else "pptx"
+        )
+
+        with tempfile.TemporaryDirectory(
+            prefix="evalora_convert_"
+        ) as temp_dir:
+
+            process = subprocess.run(
                 [
                     "libreoffice",
                     "--headless",
-                    "--convert-to", target_format,
-                    "--outdir", output_dir,
-                    path,
+                    "--convert-to",
+                    target_format,
+                    "--outdir",
+                    temp_dir,
+                    file_path,
                 ],
                 capture_output=True,
                 text=True,
                 timeout=90,
             )
 
-            target_name = (
-                os.path.splitext(os.path.basename(path))[0]
-                + target_extension
+            converted_file = (
+                Path(temp_dir)
+                / (
+                    Path(file_path).stem
+                    + target_extension
+                )
             )
-            target_path = os.path.join(output_dir, target_name)
 
-            if result.returncode != 0 or not os.path.exists(target_path):
-                raise RuntimeError(
-                    "Office file conversion failed: "
-                    + (result.stderr or result.stdout)
+            if (
+                process.returncode != 0
+                or not converted_file.exists()
+            ):
+                raise ValueError(
+                    "Could not convert the Office document. "
+                    "Try uploading DOCX or PPTX instead."
                 )
 
-            text = extract_document(target_path)
-
-        finally:
-            shutil.rmtree(output_dir, ignore_errors=True)
+            text = extract_document(
+                str(converted_file)
+            )
 
     else:
         raise ValueError(
-            "Supported formats: TXT, PDF, DOC, DOCX, PPT, PPTX, RTF."
+            "Unsupported file format. Use TXT, PDF, DOC, "
+            "DOCX, PPT, PPTX or RTF."
         )
 
     if not text or not text.strip():
         raise ValueError(
-            "No readable text found. Scanned PDFs or image-only files "
-            "need OCR before evaluation."
+            "No readable text was found. Scanned PDFs or "
+            "image-only slides require OCR."
         )
 
-    return text.strip()
+    return text.strip()[:50000]
 
 
 # =====================================================
-# JSON PARSER
+# 4. JSON AND RATING HELPERS
 # =====================================================
 
 def parse_json(response_text):
-    cleaned = response_text.strip()
+    cleaned = (response_text or "").strip()
 
     cleaned = re.sub(
         r"^```(?:json)?\s*",
@@ -249,161 +298,453 @@ def parse_json(response_text):
         cleaned,
         flags=re.IGNORECASE,
     )
-    cleaned = re.sub(r"\s*```$", "", cleaned)
+
+    cleaned = re.sub(
+        r"\s*```$",
+        "",
+        cleaned,
+    )
 
     try:
-        data = json.loads(cleaned)
+        result = json.loads(cleaned)
+
     except json.JSONDecodeError:
-        match = re.search(r"\{.*\}", cleaned, re.DOTALL)
+        match = re.search(
+            r"\{.*\}",
+            cleaned,
+            re.DOTALL,
+        )
 
         if not match:
-            raise ValueError("Gemini returned invalid JSON.")
+            raise ValueError(
+                "Gemini returned an invalid JSON response."
+            )
 
-        data = json.loads(match.group(0))
+        result = json.loads(match.group(0))
 
-    if not isinstance(data, dict):
-        raise ValueError("Gemini response must be a JSON object.")
+    if not isinstance(result, dict):
+        raise ValueError(
+            "Gemini response must be a JSON object."
+        )
 
-    return data
+    return result
 
-
-# =====================================================
-# RATING VALIDATION
-# =====================================================
 
 def normalize_rating(value):
-    text = str(value or "").strip().lower()
+    value = str(value or "").strip().lower()
 
-    # Match longer phrases before shorter phrases.
-    rating_lookup = [
-        ("needs improvement", "Needs improvement"),
+    rating_names = [
+        ("needs improvement", "Needs Improvement"),
         ("outstanding", "Outstanding"),
         ("very good", "Very Good"),
         ("incomplete", "Incomplete"),
         ("good", "Good"),
     ]
 
-    for phrase, rating in rating_lookup:
-        if re.search(r"\b" + re.escape(phrase) + r"\b", text):
+    for phrase, rating in rating_names:
+        if re.search(
+            r"\b" + re.escape(phrase) + r"\b",
+            value,
+        ):
             return rating
 
     return "Incomplete"
 
 
 def normalize_answers(raw_answers, questions):
-    lookup = {}
+    answers_lookup = {}
 
     if isinstance(raw_answers, list):
         for item in raw_answers:
             if not isinstance(item, dict):
                 continue
 
-            question = str(item.get("question", "")).strip()
-            answer = item.get("answer", item.get("rating", ""))
+            question = str(
+                item.get("question", "")
+            ).strip()
+
+            answer = item.get(
+                "answer",
+                item.get("rating", ""),
+            )
 
             if question:
-                lookup[question] = answer
+                answers_lookup[question] = answer
 
-    answers = []
+    normalized = []
 
     for index, question in enumerate(questions):
-        raw_answer = lookup.get(question, "")
+        answer = answers_lookup.get(question, "")
 
         if index < 5:
-            answer = normalize_rating(raw_answer)
-        else:
-            answer = str(raw_answer or "").strip()
-            if not answer:
-                answer = "No additional feedback provided."
+            answer = normalize_rating(answer)
 
-        answers.append({
+        else:
+            answer = str(answer or "").strip()
+
+            if not answer:
+                answer = (
+                    "No additional feedback provided."
+                )
+
+        normalized.append({
             "question": question,
             "answer": answer,
         })
 
-    return answers
+    return normalized
 
 
 # =====================================================
-# GEMINI PROMPT
+# 5. GUIDELINE COMPLIANCE NORMALIZATION
 # =====================================================
 
-def create_prompt(name, project_id, project_name, phase,
-                  guidelines, submission):
+def normalize_compliance(raw_compliance):
+    if not isinstance(raw_compliance, list):
+        return []
 
+    valid_statuses = {
+        "satisfied": "Satisfied",
+        "partially satisfied": "Partially Satisfied",
+        "not satisfied": "Not Satisfied",
+        "not applicable": "Not Applicable",
+    }
+
+    normalized = []
+
+    for item in raw_compliance:
+        if not isinstance(item, dict):
+            continue
+
+        requirement = str(
+            item.get("requirement", "")
+        ).strip()
+
+        if not requirement:
+            continue
+
+        raw_status = str(
+            item.get("status", "")
+        ).strip().lower()
+
+        status = valid_statuses.get(
+            raw_status,
+            "Not Satisfied",
+        )
+
+        evidence = str(
+            item.get("evidence", "")
+        ).strip()
+
+        gap = str(
+            item.get("gap", "")
+        ).strip()
+
+        if not evidence:
+            evidence = (
+                "No supporting evidence identified."
+            )
+
+        if not gap:
+            gap = (
+                "No additional gap explanation provided."
+            )
+
+        normalized.append({
+            "requirement": requirement,
+            "status": status,
+            "evidence": evidence,
+            "gap": gap,
+        })
+
+    return normalized
+
+
+# =====================================================
+# 6. GEMINI EVALUATION PROMPT
+# =====================================================
+
+def create_prompt(
+    name,
+    project_id,
+    project_name,
+    phase,
+    guidelines,
+    submission,
+):
     questions = PHASES[phase]
 
     question_text = "\n".join(
         f"Q{i}: {question}"
-        for i, question in enumerate(questions, 1)
+        for i, question in enumerate(
+            questions,
+            start=1,
+        )
     )
 
     return f"""
 You are Evalora AI, an evidence-based project evaluator.
 
-STUDENT
+Your task has TWO independent parts:
+
+PART A: PHASE-SPECIFIC PROJECT EVALUATION
+PART B: GUIDELINE VS STUDENT SUBMISSION COMPLIANCE
+
+The EVALUATION GUIDELINES define requirements and rules.
+The STUDENT SUBMISSION is the work being evaluated.
+
+The two documents are NOT expected to contain identical text.
+Compare their meaning and evidence, not their wording.
+
+=====================================================
+STUDENT DETAILS
+=====================================================
+
 Name: {name}
 Project ID: {project_id}
 Project Name: {project_name}
-Phase: {phase}
+Selected Phase: {phase}
 
-QUESTIONS
+=====================================================
+PHASE QUESTIONS
+=====================================================
+
 {question_text}
 
+=====================================================
 EVALUATION GUIDELINES
-{guidelines[:25000]}
+=====================================================
 
+{guidelines[:20000]}
+
+=====================================================
 STUDENT SUBMISSION
-{submission[:40000]}
+=====================================================
 
-STRICT RULES:
-1. Q1-Q5 must contain exactly one of these ratings:
-   Outstanding, Very Good, Good, Needs improvement, Incomplete.
-2. Q1-Q5 must contain the rating ONLY. No explanations.
-3. Q6 must contain additional feedback text only.
-4. Use evidence in the documents. Do not invent facts.
-5. ai_confidence_score must be between 0 and 100.
-6. Overall score is the average of Q1-Q5 using:
-   Outstanding=100, Very Good=85, Good=70,
-   Needs improvement=40, Incomplete=0.
-7. Feedback is a concise overall assessment.
-8. Suggestions are practical improvement actions.
+{submission[:30000]}
 
-Return valid JSON only:
+=====================================================
+PART A: PHASE EVALUATION RULES
+=====================================================
+
+1. Evaluate Q1-Q5 independently using relevant evidence.
+2. Judge the work according to the selected phase: {phase}.
+3. Do not invent statistics, tests, research, features or results.
+4. Use only these exact ratings for Q1-Q5:
+
+   Outstanding
+   Very Good
+   Good
+   Needs Improvement
+   Incomplete
+
+5. Outstanding means strong evidence with no major gaps.
+6. Very Good means well addressed with minor gaps.
+7. Good means reasonably addressed but meaningful details
+   are missing.
+8. Needs Improvement means major evidence gaps remain.
+9. Incomplete means absent or not assessable.
+10. Q5 is the overall quality rating and must be judged
+    independently of Q1-Q4.
+11. Q6 is concise, constructive feedback, not a rating.
+12. Overall feedback must summarize strengths and important gaps.
+13. Suggestions must be specific and actionable.
+14. ai_confidence_score represents confidence in the
+    readability and completeness of the supplied evidence,
+    from 0 to 100.
+15. Do not return an overall score. The application calculates it.
+
+Rating-score mapping:
+Outstanding = 100
+Very Good = 85
+Good = 70
+Needs Improvement = 40
+Incomplete = 0
+
+=====================================================
+PART B: GUIDELINE COMPLIANCE CHECK
+=====================================================
+
+Your objective is to determine whether the STUDENT SUBMISSION
+satisfies the applicable requirements in the GUIDELINES.
+
+STEP 1: EXTRACT REQUIREMENTS
+
+Identify the distinct, actionable requirements, mandatory
+deliverables, constraints and criteria stated in the guidelines.
+
+Focus on requirements relevant to the selected phase.
+
+Do not treat every explanatory sentence, example, heading or
+background paragraph as a separate requirement.
+
+Do not invent requirements that are absent from the guidelines.
+
+If a guideline explicitly defines different requirements for
+different phases, apply the requirements relevant to {phase}.
+
+If the guidelines do not distinguish phases, assess their
+applicable requirements without inventing phase restrictions.
+
+STEP 2: FIND STUDENT EVIDENCE
+
+For EACH applicable requirement, search the entire supplied
+student submission for relevant supporting evidence.
+
+Evidence may use different wording from the guideline.
+
+Accept synonyms, equivalent explanations and semantically
+equivalent statements.
+
+A student does not need to copy the guideline wording.
+
+Use evidence from the extracted submission, including relevant
+paragraphs, tables, slide text and speaker notes where available.
+
+Do not claim to have inspected visual content that was not
+available in the extracted text.
+
+STEP 3: DETERMINE COMPLIANCE
+
+Use these exact statuses:
+
+Satisfied:
+The submission provides sufficient relevant evidence that
+the requirement is fulfilled.
+
+Partially Satisfied:
+Some relevant evidence is present, but one or more important
+parts of the requirement are missing or incomplete.
+
+Not Satisfied:
+The requirement is missing, contradicted, or supported by
+insufficient evidence.
+
+Not Applicable:
+The requirement genuinely does not apply to this phase or
+submission according to the guideline's actual scope.
+
+Do not use Not Applicable simply because evidence is missing.
+
+STEP 4: EVIDENCE AND GAPS
+
+For every requirement, return:
+
+requirement:
+A concise description of the actual guideline requirement.
+
+status:
+One of the four exact statuses above.
+
+evidence:
+Specific evidence from the student submission. Quote a short
+phrase or faithfully paraphrase the relevant content.
+
+If no evidence is found, explicitly state that no relevant
+evidence was identified in the supplied submission.
+
+gap:
+Explain what is missing, incomplete, contradictory or needs
+improvement.
+
+For satisfied requirements, state "No major gap identified"
+when appropriate.
+
+STEP 5: QUALITY AND FAIRNESS
+
+- Compare meaning, not literal word overlap.
+- A keyword appearing in both documents is not proof of compliance.
+- Mentioning a feature does not prove it was implemented or tested.
+- A claim of success is not independent proof of success.
+- Do not invent citations, statistics, experiments, page numbers
+  or evidence.
+- Do not assume missing information exists.
+- Avoid duplicate requirements.
+- Include every distinct applicable requirement you can identify.
+- Do not arbitrarily limit the compliance list to five items.
+- If the guideline contains no identifiable requirements, return
+  an empty guideline_compliance list and explain the limitation
+  in overall feedback.
+- If the guideline is too vague to determine a requirement,
+  do not invent a precise criterion.
+- Keep compliance separate from the five phase ratings.
+
+=====================================================
+RESPONSE FORMAT
+=====================================================
+
+Return valid JSON only. Do not return Markdown fences or text
+outside the JSON object.
+
+Use exactly this structure:
+
 {{
   "phase_answers": [
-    {{"question": "{questions[0]}", "answer": "Good"}},
-    {{"question": "{questions[1]}", "answer": "Very Good"}},
-    {{"question": "{questions[2]}", "answer": "Outstanding"}},
-    {{"question": "{questions[3]}", "answer": "Good"}},
-    {{"question": "{questions[4]}", "answer": "Needs improvement"}},
-    {{"question": "{questions[5]}", "answer": "Additional feedback text"}}
+    {{
+      "question": "{questions[0]}",
+      "answer": "Good"
+    }},
+    {{
+      "question": "{questions[1]}",
+      "answer": "Very Good"
+    }},
+    {{
+      "question": "{questions[2]}",
+      "answer": "Needs Improvement"
+    }},
+    {{
+      "question": "{questions[3]}",
+      "answer": "Good"
+    }},
+    {{
+      "question": "{questions[4]}",
+      "answer": "Needs Improvement"
+    }},
+    {{
+      "question": "{questions[5]}",
+      "answer": "Constructive feedback."
+    }}
   ],
-  "ai_confidence_score": 90,
-  "feedback": "Overall evaluation feedback.",
-  "suggestions": "Suggestions for improvement."
+  "ai_confidence_score": 80,
+  "feedback": "Brief overall feedback.",
+  "suggestions": "Specific actionable suggestions.",
+  "guideline_compliance": [
+    {{
+      "requirement": "Requirement extracted from the actual guidelines",
+      "status": "Satisfied",
+      "evidence": "Relevant evidence from the actual student submission",
+      "gap": "Missing elements or explanation of remaining gaps"
+    }}
+  ]
 }}
+
+The example values illustrate the required structure only.
+Generate the actual ratings, requirements, evidence and gaps
+from the supplied documents.
 """
 
 
 # =====================================================
-# GEMINI FALLBACK
+# 7. GEMINI API WITH MODEL FALLBACK
 # =====================================================
 
 def call_gemini(prompt, progress=None):
     if not GEMINI_API_KEY:
-        raise ValueError("GEMINI_API_KEY is missing from .env.")
+        raise ValueError(
+            "GEMINI_API_KEY is missing from your .env file."
+        )
 
-    client = genai.Client(api_key=GEMINI_API_KEY)
+    client = genai.Client(
+        api_key=GEMINI_API_KEY
+    )
+
     errors = []
 
     for index, model_name in enumerate(MODELS):
         try:
-            print(f"Trying model: {model_name}")
-
             if progress:
                 progress(
-                    min(0.45 + index * 0.08, 0.68),
+                    min(0.4 + index * 0.08, 0.62),
                     desc=f"Trying {model_name}...",
                 )
 
@@ -417,49 +758,58 @@ def call_gemini(prompt, progress=None):
             )
 
             if not response.text:
-                raise ValueError("Empty Gemini response.")
+                raise ValueError(
+                    "Gemini returned an empty response."
+                )
 
-            result = parse_json(response.text)
-
-            print(f"Success with model: {model_name}")
-            return result, model_name
+            return (
+                parse_json(response.text),
+                model_name,
+            )
 
         except Exception as error:
-            errors.append(f"{model_name}: {error}")
-            print(f"Model failed: {model_name}: {error}")
+            errors.append(
+                f"{model_name}: {error}"
+            )
+
             time.sleep(1)
 
     raise RuntimeError(
-        "All configured Gemini models failed:\n"
+        "All configured Gemini models failed. Check that "
+        "the model IDs are available to your API key.\n\n"
         + "\n".join(errors)
     )
 
 
 # =====================================================
-# GOOGLE SHEETS
+# 8. GOOGLE SHEETS - EXACTLY 9 COLUMNS
 # =====================================================
 
 def connect_google_sheets():
-    if not os.path.exists(SERVICE_ACCOUNT_FILE):
+    if not SERVICE_ACCOUNT_FILE.exists():
         raise FileNotFoundError(
             "service_account.json was not found beside app.py."
         )
 
-    scopes = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive",
-    ]
-
     credentials = Credentials.from_service_account_file(
-        SERVICE_ACCOUNT_FILE,
-        scopes=scopes,
+        str(SERVICE_ACCOUNT_FILE),
+        scopes=[
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive",
+        ],
     )
 
     client = gspread.authorize(credentials)
-    spreadsheet = client.open_by_key(SPREADSHEET_ID)
+
+    spreadsheet = client.open_by_key(
+        SPREADSHEET_ID
+    )
 
     try:
-        worksheet = spreadsheet.worksheet(WORKSHEET_NAME)
+        worksheet = spreadsheet.worksheet(
+            WORKSHEET_NAME
+        )
+
     except gspread.WorksheetNotFound:
         worksheet = spreadsheet.add_worksheet(
             title=WORKSHEET_NAME,
@@ -467,13 +817,18 @@ def connect_google_sheets():
             cols=9,
         )
 
-    current_headers = worksheet.row_values(1)
+    existing_headers = worksheet.row_values(1)
 
-    if not current_headers:
-        worksheet.append_row(SHEET_HEADERS, value_input_option="RAW")
-    elif current_headers != SHEET_HEADERS:
+    if not existing_headers:
+        worksheet.append_row(
+            SHEET_HEADERS,
+            value_input_option="RAW",
+        )
+
+    elif existing_headers != SHEET_HEADERS:
         raise ValueError(
-            "Google Sheet row 1 must have these exact headers:\n"
+            "Update row 1 of the Evaluations worksheet "
+            "to these exact 9 headers:\n"
             + " | ".join(SHEET_HEADERS)
         )
 
@@ -482,84 +837,179 @@ def connect_google_sheets():
 
 def append_to_google_sheet(row_data):
     if len(row_data) != 9:
-        raise ValueError("Expected exactly 9 Google Sheets columns.")
+        raise ValueError(
+            "Google Sheets expects exactly 9 columns."
+        )
 
     worksheet = connect_google_sheets()
-    worksheet.append_row(row_data, value_input_option="RAW")
+
+    worksheet.append_row(
+        row_data,
+        value_input_option="RAW",
+    )
 
 
 # =====================================================
-# EXCEL REPORT
+# 9. GUIDELINE COMPLIANCE REPORT FOR WEBPAGE
 # =====================================================
 
-def create_excel_report(name, project_id, project_name, phase,
-                        answers, confidence, feedback,
-                        suggestions, overall_score):
+def build_compliance_report(compliance):
+    lines = [
+        "### Guideline vs Student Submission",
+        "",
+        (
+            "Each requirement is assessed against the meaning "
+            "and evidence in the student submission, not "
+            "literal text matching."
+        ),
+        "",
+    ]
 
-    summary = pd.DataFrame([{
-        "Name": name,
-        "Project ID": project_id,
-        "Project Name": project_name,
-        "Phase Type": phase,
-        "AI Confidence Score": confidence,
-        "Feedback": feedback,
-        "Suggestions": suggestions,
-        "Overall Score": overall_score,
-    }])
+    if not compliance:
+        lines.extend([
+            "**Compliance assessment unavailable.**",
+            "",
+            "No usable requirement-level results were returned. "
+            "Check whether the guideline contains identifiable "
+            "requirements and try again.",
+        ])
 
-    question_rows = pd.DataFrame([
-        {
-            "Question Number": f"Q{i}",
-            "Question": item["question"],
-            "Answer": item["answer"],
-        }
-        for i, item in enumerate(answers, 1)
+        return "\n".join(lines)
+
+    status_labels = {
+        "Satisfied": "SATISFIED",
+        "Partially Satisfied": "PARTIALLY SATISFIED",
+        "Not Satisfied": "NOT SATISFIED",
+        "Not Applicable": "NOT APPLICABLE",
+    }
+
+    counts = {
+        "Satisfied": 0,
+        "Partially Satisfied": 0,
+        "Not Satisfied": 0,
+        "Not Applicable": 0,
+    }
+
+    for index, item in enumerate(
+        compliance,
+        start=1,
+    ):
+        status = item["status"]
+        counts[status] += 1
+
+        label = status_labels[status]
+
+        lines.extend([
+            f"#### Requirement {index}: {item['requirement']}",
+            "",
+            f"**Status:** {label}",
+            "",
+            f"**Student Evidence:** {item['evidence']}",
+            "",
+            f"**Gap / Improvement:** {item['gap']}",
+            "",
+            "---",
+            "",
+        ])
+
+    total = len(compliance)
+
+    applicable = (
+        total - counts["Not Applicable"]
+    )
+
+    fully_satisfied_percentage = (
+        round(
+            counts["Satisfied"] / applicable * 100,
+            2,
+        )
+        if applicable > 0
+        else None
+    )
+
+    lines.extend([
+        "### Compliance Summary",
+        "",
+        f"- Total requirements identified: {total}",
+        f"- Satisfied: {counts['Satisfied']}",
+        f"- Partially Satisfied: {counts['Partially Satisfied']}",
+        f"- Not Satisfied: {counts['Not Satisfied']}",
+        f"- Not Applicable: {counts['Not Applicable']}",
+        "",
     ])
 
-    fd, report_path = tempfile.mkstemp(suffix=".xlsx")
-    os.close(fd)
-
-    with pd.ExcelWriter(report_path, engine="openpyxl") as writer:
-        summary.to_excel(
-            writer,
-            sheet_name="Evaluation Summary",
-            index=False,
+    if fully_satisfied_percentage is not None:
+        lines.append(
+            f"- Fully satisfied applicable requirements: "
+            f"{fully_satisfied_percentage}%"
         )
-        question_rows.to_excel(
-            writer,
-            sheet_name="Question Ratings",
-            index=False,
+    else:
+        lines.append(
+            "No applicable requirements were available "
+            "for percentage calculation."
         )
 
-    return report_path
+    lines.extend([
+        "",
+        (
+            "Note: This percentage counts only fully satisfied "
+            "applicable requirements. It is not the overall "
+            "project score."
+        ),
+    ])
+
+    return "\n".join(lines)
 
 
 # =====================================================
-# EVALUATION
+# 10. EVALUATION
 # =====================================================
 
-def evaluate(name, project_id, project_name, phase,
-             guideline_file, submission_file,
-             progress=gr.Progress()):
-
+def evaluate(
+    name,
+    project_id,
+    project_name,
+    phase,
+    guideline_file,
+    submission_file,
+    progress=gr.Progress(),
+):
     try:
         if not all([
-            name, project_id, project_name, phase,
-            guideline_file, submission_file
+            name,
+            project_id,
+            project_name,
+            phase,
+            guideline_file,
+            submission_file,
         ]):
             raise ValueError(
-                "Fill in all project details and upload both documents."
+                "Fill in all project details and upload "
+                "both documents."
             )
 
         if phase not in PHASES:
-            raise ValueError("Select a valid phase.")
+            raise ValueError(
+                "Select a valid phase."
+            )
 
-        progress(0.1, desc="Reading documents...")
+        progress(
+            0.1,
+            desc="Reading documents...",
+        )
 
-        guidelines = extract_document(guideline_file)
-        submission = extract_document(submission_file)
+        guidelines = extract_document(
+            guideline_file
+        )
 
-        progress(0.3, desc="Preparing evaluation...")
+        submission = extract_document(
+            submission_file
+        )
+
+        progress(
+            0.3,
+            desc="Preparing phase and compliance evaluation...",
+        )
 
         prompt = create_prompt(
             name,
@@ -575,13 +1025,23 @@ def evaluate(name, project_id, project_name, phase,
             progress=progress,
         )
 
-        progress(0.72, desc="Validating ratings...")
+        progress(
+            0.7,
+            desc="Validating ratings and compliance...",
+        )
 
+        # Phase-specific ratings.
         answers = normalize_answers(
             result.get("phase_answers", []),
             PHASES[phase],
         )
 
+        # Guideline compliance is used on the webpage only.
+        compliance = normalize_compliance(
+            result.get("guideline_compliance", [])
+        )
+
+        # Overall score: average of the five phase ratings.
         overall_score = round(
             sum(
                 RATING_SCORES[item["answer"]]
@@ -591,26 +1051,57 @@ def evaluate(name, project_id, project_name, phase,
         )
 
         try:
-            confidence = float(result.get("ai_confidence_score", 0))
+            confidence = float(
+                result.get(
+                    "ai_confidence_score",
+                    0,
+                )
+            )
+
         except (ValueError, TypeError):
             confidence = 0
 
-        confidence = max(0, min(100, confidence))
+        confidence = max(
+            0,
+            min(100, confidence),
+        )
 
         feedback = str(
             result.get("feedback", "")
-        ).strip() or "No overall feedback provided."
+        ).strip()
+
+        if not feedback:
+            feedback = (
+                "No overall feedback provided."
+            )
 
         suggestions = str(
             result.get("suggestions", "")
-        ).strip() or "No suggestions provided."
+        ).strip()
 
-        # Store all six questions and answers in ONE cell.
+        if not suggestions:
+            suggestions = (
+                "No suggestions provided."
+            )
+
+        # Google Sheets Questions column:
+        # Q1-Q5 contain question text and rating.
+        # Q6 contains question text only.
         questions_text = "\n\n".join(
-            f"Q{i}: {item['question']}\nAnswer: {item['answer']}"
-            for i, item in enumerate(answers, 1)
+            (
+                f"Q{i}: {item['question']}\n"
+                f"Rating: {item['answer']}"
+                if i <= 5
+                else f"Q{i}: {item['question']}"
+            )
+            for i, item in enumerate(
+                answers,
+                start=1,
+            )
         )
 
+        # Exactly 9 columns.
+        # Guideline compliance is NOT saved to Sheets.
         row_data = [
             name,
             project_id,
@@ -623,90 +1114,63 @@ def evaluate(name, project_id, project_name, phase,
             overall_score,
         ]
 
-        progress(0.8, desc="Saving to Google Sheets...")
+        progress(
+            0.82,
+            desc="Saving evaluation to Google Sheets...",
+        )
+
         append_to_google_sheet(row_data)
 
-        progress(0.9, desc="Generating Excel report...")
+        # Build the webpage results.
+        ui_lines = [
+            "# Evaluation Results",
+            "",
+            f"**Student:** {name}",
+            f"**Project ID:** {project_id}",
+            f"**Project:** {project_name}",
+            f"**Phase:** {phase}",
+            "",
+            "## Phase Ratings",
+            "",
+        ]
 
-        report_path = create_excel_report(
-            name,
-            project_id,
-            project_name,
-            phase,
-            answers,
-            confidence,
+        for index, item in enumerate(
+            answers[:5],
+            start=1,
+        ):
+            ui_lines.extend([
+                f"### Q{index}: {item['question']}",
+                "",
+                f"**Rating:** {item['answer']}",
+                "",
+            ])
+
+        ui_lines.extend([
+            "## Overall Feedback",
+            "",
             feedback,
+            "",
+            "## Suggestions",
+            "",
             suggestions,
-            overall_score,
-        )
-
-        ratings_df = pd.DataFrame([
-            {
-                "Question": item["question"],
-                "Answer": item["answer"],
-            }
-            for item in answers
+            "",
+            build_compliance_report(compliance),
         ])
 
-        summary_df = pd.DataFrame([
-            {"Field": "Model Used", "Value": used_model},
-            {"Field": "AI Confidence Score", "Value": confidence},
-            {"Field": "Feedback", "Value": feedback},
-            {"Field": "Suggestions", "Value": suggestions},
-            {"Field": "Overall Score", "Value": overall_score},
-        ])
-
-        rating_text = "\n".join(
-            f"- **Q{i}:** {item['answer']}"
-            for i, item in enumerate(answers[:5], 1)
+        progress(
+            1.0,
+            desc="Evaluation completed.",
         )
-
-        report = f"""
-# Evalora AI Evaluation Report
-
-**Student:** {name}
-
-**Project ID:** {project_id}
-
-**Project Name:** {project_name}
-
-**Phase:** {phase}
-
-**Gemini Model:** `{used_model}`
-
-**Overall Score:** {overall_score}/100
-
-**AI Confidence Score:** {confidence}/100
-
-## Question Ratings
-
-{rating_text}
-
-## Additional Feedback (Q6)
-
-{answers[5]["answer"]}
-
-## Overall Feedback
-
-{feedback}
-
-## Suggestions
-
-{suggestions}
-"""
-
-        progress(1.0, desc="Evaluation completed.")
 
         status = (
             f"Evaluation completed using {used_model}. "
-            "Saved to Google Sheets and Excel report generated."
+            "Phase ratings and overall score saved to "
+            "Google Sheets. Guideline compliance is "
+            "displayed on the webpage only."
         )
 
         return (
-            report,
-            ratings_df,
-            summary_df,
-            report_path,
+            "\n".join(ui_lines),
             status,
         )
 
@@ -715,15 +1179,12 @@ def evaluate(name, project_id, project_name, phase,
 
         return (
             f"## Error\n\n{message}",
-            pd.DataFrame(columns=["Question", "Answer"]),
-            pd.DataFrame(columns=["Field", "Value"]),
-            None,
             message,
         )
 
 
 # =====================================================
-# GRADIO WEBPAGE
+# 11. GRADIO UI
 # =====================================================
 
 with gr.Blocks(
@@ -734,24 +1195,34 @@ with gr.Blocks(
     gr.Markdown(
         """
         # Evalora AI
-        ### AI-powered project evaluation
-
-        **Supported:** TXT, PDF, DOC, DOCX, PPT, PPTX, RTF
-
-        Q1-Q5 return ratings only. Q6 provides additional feedback.
+        ### AI-powered project evaluation and guideline compliance.
         """
     )
 
     with gr.Row():
-        name_input = gr.Textbox(label="Student Name")
-        project_id_input = gr.Textbox(label="Project ID")
+        name_input = gr.Textbox(
+            label="Student Name",
+            placeholder="Enter student name",
+        )
 
-    project_name_input = gr.Textbox(label="Project Name")
+        project_id_input = gr.Textbox(
+            label="Project ID",
+            placeholder="Enter project ID",
+        )
+
+    project_name_input = gr.Textbox(
+        label="Project Name",
+        placeholder="Enter project name",
+    )
 
     phase_input = gr.Dropdown(
         choices=list(PHASES.keys()),
         value="Ideation",
         label="Phase Type",
+    )
+
+    gr.Markdown(
+        "### Upload Documents"
     )
 
     with gr.Row():
@@ -772,22 +1243,14 @@ with gr.Blocks(
         variant="primary",
     )
 
-    status_output = gr.Markdown()
-    report_output = gr.Markdown()
+    result_output = gr.Markdown(
+        label="Evaluation Results",
+    )
 
-    with gr.Accordion("Question Ratings", open=True):
-        ratings_output = gr.Dataframe(
-            label="Q1-Q6",
-            interactive=False,
-        )
-
-    with gr.Accordion("Evaluation Summary", open=True):
-        summary_output = gr.Dataframe(
-            label="Evaluation Summary",
-            interactive=False,
-        )
-
-    excel_output = gr.File(label="Download Excel Report")
+    status_output = gr.Textbox(
+        label="Status",
+        interactive=False,
+    )
 
     evaluate_button.click(
         fn=evaluate,
@@ -800,17 +1263,14 @@ with gr.Blocks(
             submission_input,
         ],
         outputs=[
-            report_output,
-            ratings_output,
-            summary_output,
-            excel_output,
+            result_output,
             status_output,
         ],
     )
 
 
 # =====================================================
-# START SERVER
+# 12. APPLICATION ENTRY POINT
 # =====================================================
 
 if __name__ == "__main__":
