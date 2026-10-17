@@ -1,10 +1,10 @@
-google-genai
-pandas
-openpyxl
-pypdf
-python-pptx
-python-docx
 gradio
+google-genai
+python-dotenv
 gspread
 google-auth
-python-dotenv
+pandas
+openpyxl
+pymupdf
+python-docx
+python-pptx
